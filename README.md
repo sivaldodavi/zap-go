@@ -9,7 +9,7 @@ go build -o zap-tui main.go
 ### 2. Uso Global (Link Simbólico)
 
 ```bash
-ln -sf $(pwd)/zap-tui ~/.local/bin/zap-tui
+ln -sf $(pwd)/zap-tui /usr/local/bin
 
 ```
 
