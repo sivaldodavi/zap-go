@@ -26,7 +26,7 @@ O arquivo deve estar em: `~/.local/share/contatos`
 
 ```csv
 Nome,Telefone,Email
-Alessandro,+559884307872,
+Alessandro,+5598xxxxxxxx,
 
 ```
 
