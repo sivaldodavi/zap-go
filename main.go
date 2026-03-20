@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// --- Estilos ---
 var (
 	senderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
 	receiverStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
@@ -42,7 +43,85 @@ type model struct {
 	target    string
 	name      string
 	mode      string
+	contacts  map[string]string
 }
+
+// --- Lógica de Identificação de Contatos ---
+
+// cleanNumber remove tudo que não é dígito
+func cleanNumber(phone string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phone)
+}
+
+// findContactName busca o nome comparando o final do número (últimos 8 dígitos)
+// Isso evita problemas com prefixos 55, +55 ou nono dígito variável.
+func findContactName(jidNumber string, contacts map[string]string) string {
+	cleanJid := cleanNumber(jidNumber)
+	if len(cleanJid) < 8 {
+		return jidNumber
+	}
+	
+	suffixJid := cleanJid[len(cleanJid)-8:]
+
+	for phone, name := range contacts {
+		cleanStored := cleanNumber(phone)
+		if len(cleanStored) >= 8 {
+			suffixStored := cleanStored[len(cleanStored)-8:]
+			if suffixJid == suffixStored {
+				return name
+			}
+		}
+	}
+	return jidNumber
+}
+
+func loadContactsMap() map[string]string {
+	contacts := make(map[string]string)
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".local/share/contatos")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return contacts
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		parts := strings.Split(line, ",")
+		if len(parts) >= 2 {
+			name := strings.TrimSpace(parts[0])
+			phone := strings.TrimSpace(parts[1])
+			if name != "" && phone != "" && name != "Nome" {
+				contacts[phone] = name
+			}
+		}
+	}
+	return contacts
+}
+
+func getContactViaFzf() (string, string) {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".local/share/contatos")
+
+	cmdStr := fmt.Sprintf("tail -n +2 %s | fzf --header 'Selecionar Contato' --delimiter ',' --with-nth 1", path)
+	out, err := exec.Command("sh", "-c", cmdStr).Output()
+	if err != nil {
+		return "", ""
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(out)), ",")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	return parts[0], cleanNumber(parts[1])
+}
+
+// --- Bubble Tea Model ---
 
 func (m model) Init() tea.Cmd { return textinput.Blink }
 
@@ -88,36 +167,14 @@ func (m model) View() string {
 
 	view := systemStyle.Render(header) + "\n" + boxStyle.Width(65).Height(15).Render(body.String())
 	footer := systemStyle.Render("\n Ctrl+C para encerrar")
-	
+
 	if m.mode == "send" {
 		return view + footer + "\n" + m.textInput.View()
 	}
 	return view + footer
 }
 
-func getContactViaFzf() (string, string) {
-	home, _ := os.UserHomeDir()
-	path := filepath.Join(home, ".local/share/contatos")
-	
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		os.MkdirAll(filepath.Dir(path), 0755)
-		os.WriteFile(path, []byte("Nome,Telefone,Email\nExemplo,+5500000000000,\n"), 0644)
-	}
-
-	cmdStr := fmt.Sprintf("tail -n +2 %s | fzf --header 'Selecionar Contato' --delimiter ',' --with-nth 1", path)
-	out, err := exec.Command("sh", "-c", cmdStr).Output()
-	if err != nil { return "", "" }
-
-	parts := strings.Split(strings.TrimSpace(string(out)), ",")
-	if len(parts) < 2 { return "", "" }
-	
-	num := strings.Map(func(r rune) rune {
-		if r >= '0' && r <= '9' { return r }
-		return -1
-	}, parts[1])
-
-	return parts[0], num
-}
+// --- Main ---
 
 func main() {
 	if len(os.Args) < 2 {
@@ -126,25 +183,24 @@ func main() {
 	}
 
 	mode := os.Args[1]
+	contactsMap := loadContactsMap()
 	var contactName, contactPhone string
 
 	if mode == "send" {
 		contactName, contactPhone = getContactViaFzf()
-		if contactPhone == "" { return }
+		if contactPhone == "" {
+			return
+		}
 	}
 
-	// Localiza o diretório real do binário para persistência do DB
 	exePath, _ := os.Executable()
-	realPath, err := filepath.EvalSymlinks(exePath)
-	if err != nil {
-		realPath = exePath
-	}
+	realPath, _ := filepath.EvalSymlinks(exePath)
 	dbPath := filepath.Join(filepath.Dir(realPath), "whatsapp.db")
 	dbURI := fmt.Sprintf("file:%s?_foreign_keys=on", dbPath)
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", dbURI, waLog.Stdout("Database", "ERROR", true))
 	if err != nil {
-		panic(fmt.Errorf("erro ao abrir banco de dados (%s): %w", dbPath, err))
+		panic(err)
 	}
 
 	device, _ := container.GetFirstDevice(context.Background())
@@ -160,6 +216,7 @@ func main() {
 		target:    contactPhone,
 		name:      contactName,
 		mode:      mode,
+		contacts:  contactsMap,
 	})
 
 	client.AddEventHandler(func(evt interface{}) {
@@ -169,7 +226,19 @@ func main() {
 				txt = v.Message.GetExtendedTextMessage().GetText()
 			}
 			if txt != "" {
-				p.Send(chatMsg{sender: v.Info.Sender.User, content: txt, isMe: false})
+				// Usa a nova lógica de comparação parcial para identificar o remetente
+				senderName := findContactName(v.Info.Sender.User, contactsMap)
+				
+				// Se não achou no CSV, tenta o PushName do WhatsApp
+				if senderName == v.Info.Sender.User && v.Info.PushName != "" {
+					senderName = v.Info.PushName
+				}
+
+				p.Send(chatMsg{
+					sender:  senderName,
+					content: txt,
+					isMe:    v.Info.IsFromMe,
+				})
 			}
 		}
 	})
@@ -187,9 +256,7 @@ func main() {
 	}
 
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Erro: %v\n", err)
 		os.Exit(1)
 	}
-	
 	client.Disconnect()
 }
