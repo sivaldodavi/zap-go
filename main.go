@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -68,6 +69,12 @@ var (
 			BorderTop(true).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("240"))
+
+	styleUnreadBadge = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("0")).
+				Background(lipgloss.Color("9")).
+				Bold(true).
+				Padding(0, 1)
 )
 
 // ─── Histórico persistente ────────────────────────────────────────────────────
@@ -79,10 +86,22 @@ type storedMsg struct {
 	Time    time.Time `json:"time"`
 }
 
-func historyPath(phone string) string {
+type chatMetadata struct {
+	LastRead time.Time `json:"last_read"`
+}
+
+func dataDir() string {
 	dir := filepath.Join(os.Getenv("HOME"), ".local", "share", "zap-tui")
 	os.MkdirAll(dir, 0700)
-	return filepath.Join(dir, phone+".json")
+	return dir
+}
+
+func historyPath(phone string) string {
+	return filepath.Join(dataDir(), phone+".json")
+}
+
+func metadataPath(phone string) string {
+	return filepath.Join(dataDir(), phone+".meta.json")
 }
 
 func loadHistory(phone string) []storedMsg {
@@ -98,6 +117,21 @@ func loadHistory(phone string) []storedMsg {
 func saveHistory(phone string, msgs []storedMsg) {
 	data, _ := json.Marshal(msgs)
 	os.WriteFile(historyPath(phone), data, 0600)
+}
+
+func loadMetadata(phone string) chatMetadata {
+	data, err := os.ReadFile(metadataPath(phone))
+	if err != nil {
+		return chatMetadata{}
+	}
+	var meta chatMetadata
+	json.Unmarshal(data, &meta)
+	return meta
+}
+
+func saveMetadata(phone string, meta chatMetadata) {
+	data, _ := json.Marshal(meta)
+	os.WriteFile(metadataPath(phone), data, 0600)
 }
 
 // ─── Contatos (formato abook) ─────────────────────────────────────────────────
@@ -142,6 +176,112 @@ func loadAbook() []contact {
 	return contacts
 }
 
+func cleanNumber(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, s)
+}
+
+// ─── Lista de Conversas ───────────────────────────────────────────────────────
+
+type chatInfo struct {
+	contact    contact
+	phone      string
+	lastMsg    time.Time
+	unreadCount int
+	preview    string
+}
+
+func getChats(contacts []contact) []chatInfo {
+	var chats []chatInfo
+
+	for _, c := range contacts {
+		phone := cleanNumber(c.mobile)
+		history := loadHistory(phone)
+		if len(history) == 0 {
+			continue
+		}
+
+		meta := loadMetadata(phone)
+		lastMsg := history[len(history)-1]
+		
+		unread := 0
+		preview := lastMsg.Content
+		if len(preview) > 50 {
+			preview = preview[:50] + "..."
+		}
+
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Time.After(meta.LastRead) && !history[i].IsMe {
+				unread++
+			}
+		}
+
+		chats = append(chats, chatInfo{
+			contact:    c,
+			phone:      phone,
+			lastMsg:    lastMsg.Time,
+			unreadCount: unread,
+			preview:    preview,
+		})
+	}
+
+	sort.Slice(chats, func(i, j int) bool {
+		return chats[i].lastMsg.After(chats[j].lastMsg)
+	})
+
+	return chats
+}
+
+func pickChatFzf(chats []chatInfo) (contact, bool) {
+	if len(chats) == 0 {
+		return contact{}, false
+	}
+
+	var lines []string
+	for _, c := range chats {
+		badge := ""
+		if c.unreadCount > 0 {
+			badge = fmt.Sprintf("[%d] ", c.unreadCount)
+		}
+		when := c.lastMsg.Format("02/01 15:04")
+		line := fmt.Sprintf("%s%s\t%s\t%s\t%s",
+			badge, c.contact.name, c.contact.mobile, when, c.preview)
+		lines = append(lines, line)
+	}
+
+	cmd := exec.Command("fzf",
+		"--prompt=Conversa: ",
+		"--delimiter=\t",
+		"--with-nth=1",
+		"--header=Enter para abrir  Tab para novo  Esc para sair",
+		"--bind=tab:abort",
+	)
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	
+	if err != nil {
+		if err.Error() == "exit status 130" { // Tab pressed
+			return pickContactFzf(loadAbook())
+		}
+		return contact{}, false
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 4)
+	if len(parts) < 2 {
+		return contact{}, false
+	}
+	
+	name := strings.TrimLeft(parts[0], "0123456789[] ")
+	mobile := parts[1]
+	
+	return contact{name: name, mobile: mobile}, true
+}
+
 func pickContactFzf(contacts []contact) (contact, bool) {
 	if len(contacts) == 0 {
 		return contact{}, false
@@ -152,7 +292,7 @@ func pickContactFzf(contacts []contact) (contact, bool) {
 	}
 
 	cmd := exec.Command("fzf",
-		"--prompt=Contato: ",
+		"--prompt=Novo contato: ",
 		"--delimiter=\t",
 		"--with-nth=1",
 		"--header=Enter para abrir  Esc para sair",
@@ -168,15 +308,6 @@ func pickContactFzf(contacts []contact) (contact, bool) {
 		return contact{}, false
 	}
 	return contact{name: parts[0], mobile: parts[1]}, true
-}
-
-func cleanNumber(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r >= '0' && r <= '9' {
-			return r
-		}
-		return -1
-	}, s)
 }
 
 // ─── Modelo Bubble Tea ────────────────────────────────────────────────────────
@@ -207,6 +338,11 @@ func newModel(client *whatsmeow.Client, target contact) model {
 	ti.Placeholder = "mensagem..."
 	ti.Focus()
 	ti.CharLimit = 1000
+
+	// Marcar como lido ao abrir
+	meta := loadMetadata(phone)
+	meta.LastRead = time.Now()
+	saveMetadata(phone, meta)
 
 	return model{
 		client:    client,
@@ -247,6 +383,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			saveHistory(m.phone, m.history)
+			// Atualizar última leitura ao sair
+			meta := loadMetadata(m.phone)
+			meta.LastRead = time.Now()
+			saveMetadata(m.phone, meta)
 			return m, tea.Quit
 
 		case tea.KeyEnter:
@@ -352,8 +492,17 @@ func (m model) View() string {
 
 func main() {
 	contacts := loadAbook()
+	chats := getChats(contacts)
 
-	chosen, ok := pickContactFzf(contacts)
+	var chosen contact
+	var ok bool
+
+	if len(chats) > 0 {
+		chosen, ok = pickChatFzf(chats)
+	} else {
+		chosen, ok = pickContactFzf(contacts)
+	}
+
 	if !ok {
 		return
 	}
@@ -435,4 +584,3 @@ func main() {
 	}
 	client.Disconnect()
 }
-
