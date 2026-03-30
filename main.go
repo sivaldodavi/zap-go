@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mdp/qrterminal/v3"
@@ -22,175 +26,336 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// --- Estilos ---
+// ─── Estilos (aerc-like) ──────────────────────────────────────────────────────
+
 var (
-	senderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
-	receiverStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
-	systemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
-	boxStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1).BorderForeground(lipgloss.Color("63"))
+	styleHeader = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("15")).
+			Background(lipgloss.Color("238")).
+			Padding(0, 1)
+
+	styleStatus = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243")).
+			Background(lipgloss.Color("236")).
+			Padding(0, 1)
+
+	styleDivider = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240"))
+
+	styleMyName = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10")).
+			Bold(true)
+
+	styleTheirName = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("12")).
+			Bold(true)
+
+	styleTimestamp = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240"))
+
+	styleMyMsg = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	styleTheirMsg = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("255"))
+
+	styleInputPrompt = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("10")).
+				Bold(true)
+
+	styleInputBar = lipgloss.NewStyle().
+			BorderTop(true).
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("240"))
 )
 
-type chatMsg struct {
-	sender  string
-	content string
-	isMe    bool
+// ─── Histórico persistente ────────────────────────────────────────────────────
+
+type storedMsg struct {
+	Sender  string    `json:"sender"`
+	Content string    `json:"content"`
+	IsMe    bool      `json:"is_me"`
+	Time    time.Time `json:"time"`
 }
 
-type model struct {
-	client    *whatsmeow.Client
-	history   []chatMsg
-	textInput textinput.Model
-	target    string
-	name      string
-	mode      string
-	contacts  map[string]string
+func historyPath(phone string) string {
+	dir := filepath.Join(os.Getenv("HOME"), ".local", "share", "zap-tui")
+	os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, phone+".json")
 }
 
-// --- Lógica de Identificação de Contatos ---
+func loadHistory(phone string) []storedMsg {
+	data, err := os.ReadFile(historyPath(phone))
+	if err != nil {
+		return nil
+	}
+	var msgs []storedMsg
+	json.Unmarshal(data, &msgs)
+	return msgs
+}
 
-// cleanNumber remove tudo que não é dígito
-func cleanNumber(phone string) string {
+func saveHistory(phone string, msgs []storedMsg) {
+	data, _ := json.Marshal(msgs)
+	os.WriteFile(historyPath(phone), data, 0600)
+}
+
+// ─── Contatos (formato abook) ─────────────────────────────────────────────────
+
+type contact struct {
+	name   string
+	mobile string
+}
+
+func loadAbook() []contact {
+	path := filepath.Join(os.Getenv("HOME"), ".local", "share", "abook", "addressbook")
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var contacts []contact
+	var cur contact
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "[") && line != "[format]" {
+			if cur.name != "" && cur.mobile != "" {
+				contacts = append(contacts, cur)
+			}
+			cur = contact{}
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			switch strings.TrimSpace(k) {
+			case "name":
+				cur.name = strings.TrimSpace(v)
+			case "mobile":
+				cur.mobile = strings.TrimSpace(v)
+			}
+		}
+	}
+	if cur.name != "" && cur.mobile != "" {
+		contacts = append(contacts, cur)
+	}
+	return contacts
+}
+
+func pickContactFzf(contacts []contact) (contact, bool) {
+	if len(contacts) == 0 {
+		return contact{}, false
+	}
+	var lines []string
+	for _, c := range contacts {
+		lines = append(lines, fmt.Sprintf("%s\t%s", c.name, c.mobile))
+	}
+
+	cmd := exec.Command("fzf",
+		"--prompt=Contato: ",
+		"--delimiter=\t",
+		"--with-nth=1",
+		"--header=Enter para abrir  Esc para sair",
+	)
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return contact{}, false
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 2)
+	if len(parts) < 2 {
+		return contact{}, false
+	}
+	return contact{name: parts[0], mobile: parts[1]}, true
+}
+
+func cleanNumber(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r >= '0' && r <= '9' {
 			return r
 		}
 		return -1
-	}, phone)
+	}, s)
 }
 
-// findContactName busca o nome comparando o final do número (últimos 8 dígitos)
-// Isso evita problemas com prefixos 55, +55 ou nono dígito variável.
-func findContactName(jidNumber string, contacts map[string]string) string {
-	cleanJid := cleanNumber(jidNumber)
-	if len(cleanJid) < 8 {
-		return jidNumber
-	}
-	
-	suffixJid := cleanJid[len(cleanJid)-8:]
+// ─── Modelo Bubble Tea ────────────────────────────────────────────────────────
 
-	for phone, name := range contacts {
-		cleanStored := cleanNumber(phone)
-		if len(cleanStored) >= 8 {
-			suffixStored := cleanStored[len(cleanStored)-8:]
-			if suffixJid == suffixStored {
-				return name
-			}
-		}
-	}
-	return jidNumber
+type incomingMsg struct {
+	sender  string
+	content string
+	isMe    bool
+	ts      time.Time
 }
 
-func loadContactsMap() map[string]string {
-	contacts := make(map[string]string)
-	home, _ := os.UserHomeDir()
-	path := filepath.Join(home, ".local/share/contatos")
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return contacts
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		parts := strings.Split(line, ",")
-		if len(parts) >= 2 {
-			name := strings.TrimSpace(parts[0])
-			phone := strings.TrimSpace(parts[1])
-			if name != "" && phone != "" && name != "Nome" {
-				contacts[phone] = name
-			}
-		}
-	}
-	return contacts
+type model struct {
+	client    *whatsmeow.Client
+	target    contact
+	phone     string
+	history   []storedMsg
+	viewport  viewport.Model
+	textInput textinput.Model
+	width     int
+	height    int
+	ready     bool
 }
 
-func getContactViaFzf() (string, string) {
-	home, _ := os.UserHomeDir()
-	path := filepath.Join(home, ".local/share/contatos")
+func newModel(client *whatsmeow.Client, target contact) model {
+	phone := cleanNumber(target.mobile)
 
-	cmdStr := fmt.Sprintf("tail -n +2 %s | fzf --header 'Selecionar Contato' --delimiter ',' --with-nth 1", path)
-	out, err := exec.Command("sh", "-c", cmdStr).Output()
-	if err != nil {
-		return "", ""
-	}
+	ti := textinput.New()
+	ti.Placeholder = "mensagem..."
+	ti.Focus()
+	ti.CharLimit = 1000
 
-	parts := strings.Split(strings.TrimSpace(string(out)), ",")
-	if len(parts) < 2 {
-		return "", ""
+	return model{
+		client:    client,
+		target:    target,
+		phone:     phone,
+		history:   loadHistory(phone),
+		textInput: ti,
 	}
-	return parts[0], cleanNumber(parts[1])
 }
 
-// --- Bubble Tea Model ---
-
-func (m model) Init() tea.Cmd { return textinput.Blink }
+func (m model) Init() tea.Cmd {
+	return textinput.Blink
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		vpH := m.height - 4
+		if vpH < 1 {
+			vpH = 1
+		}
+		if !m.ready {
+			m.viewport = viewport.New(m.width, vpH)
+			m.ready = true
+		} else {
+			m.viewport.Width = m.width
+			m.viewport.Height = vpH
+		}
+		m.viewport.SetContent(m.renderHistory())
+		m.viewport.GotoBottom()
+
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC {
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			saveHistory(m.phone, m.history)
 			return m, tea.Quit
-		}
-		if m.mode == "send" && msg.Type == tea.KeyEnter {
-			input := strings.TrimSpace(m.textInput.Value())
-			if input != "" && m.target != "" {
-				jid, _ := types.ParseJID(m.target + "@s.whatsapp.net")
-				go m.client.SendMessage(context.Background(), jid, &waE2E.Message{Conversation: proto.String(input)})
-				m.history = append(m.history, chatMsg{sender: "Você", content: input, isMe: true})
-				m.textInput.Reset()
+
+		case tea.KeyEnter:
+			text := strings.TrimSpace(m.textInput.Value())
+			if text == "" {
+				break
 			}
+			jid, err := types.ParseJID(m.phone + "@s.whatsapp.net")
+			if err == nil {
+				go m.client.SendMessage(context.Background(), jid, &waE2E.Message{
+					Conversation: proto.String(text),
+				})
+			}
+			entry := storedMsg{Sender: "eu", Content: text, IsMe: true, Time: time.Now()}
+			m.history = append(m.history, entry)
+			saveHistory(m.phone, m.history)
+			m.textInput.Reset()
+			m.viewport.SetContent(m.renderHistory())
+			m.viewport.GotoBottom()
 		}
-	case chatMsg:
-		m.history = append(m.history, msg)
+
+	case incomingMsg:
+		entry := storedMsg{
+			Sender:  msg.sender,
+			Content: msg.content,
+			IsMe:    msg.isMe,
+			Time:    msg.ts,
+		}
+		m.history = append(m.history, entry)
+		saveHistory(m.phone, m.history)
+		m.viewport.SetContent(m.renderHistory())
+		m.viewport.GotoBottom()
 	}
-	var cmd tea.Cmd
-	if m.mode == "send" {
-		m.textInput, cmd = m.textInput.Update(msg)
+
+	var vpCmd tea.Cmd
+	m.viewport, vpCmd = m.viewport.Update(msg)
+	cmds = append(cmds, vpCmd)
+
+	var tiCmd tea.Cmd
+	m.textInput, tiCmd = m.textInput.Update(msg)
+	cmds = append(cmds, tiCmd)
+
+	return m, tea.Batch(cmds...)
+}
+
+func (m model) renderHistory() string {
+	if len(m.history) == 0 {
+		return styleTimestamp.Render("  sem mensagens ainda")
 	}
-	return m, cmd
+
+	var sb strings.Builder
+	lastDate := ""
+
+	for _, msg := range m.history {
+		date := msg.Time.Format("02 Jan 2006")
+		if date != lastDate {
+			lastDate = date
+			pad := (m.width - len(date) - 4) / 2
+			if pad < 1 {
+				pad = 1
+			}
+			line := strings.Repeat("─", pad) + "  " + date + "  " + strings.Repeat("─", pad)
+			sb.WriteString("\n" + styleDivider.Render(line) + "\n\n")
+		}
+
+		ts := styleTimestamp.Render(msg.Time.Format("15:04"))
+
+		if msg.IsMe {
+			name := styleMyName.Render("eu")
+			content := styleMyMsg.Render(msg.Content)
+			sb.WriteString(fmt.Sprintf(" %s %s  %s\n", name, ts, content))
+		} else {
+			name := styleTheirName.Render(msg.Sender)
+			content := styleTheirMsg.Render(msg.Content)
+			sb.WriteString(fmt.Sprintf(" %s %s  %s\n", name, ts, content))
+		}
+	}
+	return sb.String()
 }
 
 func (m model) View() string {
-	var body strings.Builder
-	for _, c := range m.history {
-		style := receiverStyle
-		if c.isMe {
-			style = senderStyle
-		}
-		body.WriteString(fmt.Sprintf("%s %s\n", style.Render(c.sender+":"), c.content))
+	if !m.ready {
+		return ""
 	}
 
-	header := "[ Monitor de Mensagens ]"
-	if m.mode == "send" {
-		header = fmt.Sprintf("[ Chat: %s ]", m.name)
-	}
+	header := styleHeader.Width(m.width).Render(
+		fmt.Sprintf("zap  ─  %s  (%s)", m.target.name, m.target.mobile),
+	)
 
-	view := systemStyle.Render(header) + "\n" + boxStyle.Width(65).Height(15).Render(body.String())
-	footer := systemStyle.Render("\n Ctrl+C para encerrar")
+	chat := m.viewport.View()
 
-	if m.mode == "send" {
-		return view + footer + "\n" + m.textInput.View()
-	}
-	return view + footer
+	prompt := styleInputPrompt.Render(" > ")
+	inputArea := styleInputBar.Width(m.width).Render(prompt + m.textInput.View())
+
+	status := styleStatus.Width(m.width).Render(
+		fmt.Sprintf(" %d mensagens  │  PgUp/PgDn rolar  │  Ctrl+C sair", len(m.history)),
+	)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, chat, inputArea, status)
 }
 
-// --- Main ---
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Uso: zap-tui [send|receive]")
+	contacts := loadAbook()
+
+	chosen, ok := pickContactFzf(contacts)
+	if !ok {
 		return
-	}
-
-	mode := os.Args[1]
-	contactsMap := loadContactsMap()
-	var contactName, contactPhone string
-
-	if mode == "send" {
-		contactName, contactPhone = getContactViaFzf()
-		if contactPhone == "" {
-			return
-		}
 	}
 
 	exePath, _ := os.Executable()
@@ -198,49 +363,59 @@ func main() {
 	dbPath := filepath.Join(filepath.Dir(realPath), "whatsapp.db")
 	dbURI := fmt.Sprintf("file:%s?_foreign_keys=on", dbPath)
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", dbURI, waLog.Stdout("Database", "ERROR", true))
+	container, err := sqlstore.New(
+		context.Background(), "sqlite3", dbURI,
+		waLog.Stdout("Database", "ERROR", true),
+	)
 	if err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, "erro ao abrir db:", err)
+		os.Exit(1)
 	}
 
 	device, _ := container.GetFirstDevice(context.Background())
 	client := whatsmeow.NewClient(device, waLog.Stdout("Client", "ERROR", true))
 
-	ti := textinput.New()
-	ti.Placeholder = "Mensagem..."
-	ti.Focus()
+	m := newModel(client, chosen)
+	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	p := tea.NewProgram(model{
-		client:    client,
-		textInput: ti,
-		target:    contactPhone,
-		name:      contactName,
-		mode:      mode,
-		contacts:  contactsMap,
-	})
+	phoneClean := cleanNumber(chosen.mobile)
 
 	client.AddEventHandler(func(evt interface{}) {
-		if v, ok := evt.(*events.Message); ok {
-			txt := v.Message.GetConversation()
-			if txt == "" {
-				txt = v.Message.GetExtendedTextMessage().GetText()
-			}
-			if txt != "" {
-				// Usa a nova lógica de comparação parcial para identificar o remetente
-				senderName := findContactName(v.Info.Sender.User, contactsMap)
-				
-				// Se não achou no CSV, tenta o PushName do WhatsApp
-				if senderName == v.Info.Sender.User && v.Info.PushName != "" {
-					senderName = v.Info.PushName
-				}
-
-				p.Send(chatMsg{
-					sender:  senderName,
-					content: txt,
-					isMe:    v.Info.IsFromMe,
-				})
-			}
+		v, ok := evt.(*events.Message)
+		if !ok {
+			return
 		}
+
+		txt := v.Message.GetConversation()
+		if txt == "" {
+			txt = v.Message.GetExtendedTextMessage().GetText()
+		}
+		if txt == "" {
+			return
+		}
+
+		senderClean := cleanNumber(v.Info.Sender.User)
+		mine := v.Info.IsFromMe
+
+		relevant := mine
+		if !mine && len(senderClean) >= 8 && len(phoneClean) >= 8 {
+			relevant = senderClean[len(senderClean)-8:] == phoneClean[len(phoneClean)-8:]
+		}
+		if !relevant {
+			return
+		}
+
+		senderName := chosen.name
+		if mine {
+			senderName = "eu"
+		}
+
+		p.Send(incomingMsg{
+			sender:  senderName,
+			content: txt,
+			isMe:    mine,
+			ts:      v.Info.Timestamp,
+		})
 	})
 
 	if client.Store.ID == nil {
@@ -260,3 +435,4 @@ func main() {
 	}
 	client.Disconnect()
 }
+
