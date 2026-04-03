@@ -1,11 +1,8 @@
 # Binários
-zap-tui
-whatsapp_client
+zap
 
 # Dados sensíveis
 whatsapp.db
-whatsapp.db-shm
-whatsapp.db-wal
 
 # Logs e temporários
 /tmp/wtc_status
