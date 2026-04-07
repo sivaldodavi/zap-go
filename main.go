@@ -30,7 +30,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Log em arquivo (rotativo simples: renomeia ao passar de 1 MB)
+// Log em arquivo
 // ---------------------------------------------------------------------------
 
 var (
@@ -81,7 +81,7 @@ type Config struct {
 	SMTP SMTPConfig `toml:"smtp"`
 }
 
-var exeDir string // diretório do binário, calculado uma vez no main
+var exeDir string
 
 func loadConfig() Config {
 	cfgPath := filepath.Join(exeDir, "config.toml")
@@ -94,7 +94,7 @@ func loadConfig() Config {
 }
 
 // ---------------------------------------------------------------------------
-// Lock file — impede dupla instância
+// Lock file
 // ---------------------------------------------------------------------------
 
 func acquireLock() (*os.File, bool) {
@@ -103,7 +103,6 @@ func acquireLock() (*os.File, bool) {
 	if err != nil {
 		return nil, false
 	}
-	// Tenta lock exclusivo não-bloqueante via syscall
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		f.Close()
@@ -117,34 +116,6 @@ func releaseLock(f *os.File) {
 	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	f.Close()
 	os.Remove(filepath.Join(exeDir, "zap.lock"))
-}
-
-// ---------------------------------------------------------------------------
-// Email
-// ---------------------------------------------------------------------------
-
-func sendEmailWithAttachment(cfg Config, subject, body, fileName string, fileData []byte) {
-	e := email.NewEmail()
-	e.From = fmt.Sprintf("Zap <%s>", cfg.SMTP.User)
-	e.To = []string{cfg.SMTP.User}
-	e.Subject = subject
-	e.Text = []byte(body)
-	if len(fileData) > 0 {
-		e.Attach(bytes.NewReader(fileData), fileName, "application/octet-stream")
-	}
-	addr := fmt.Sprintf("%s:%d", cfg.SMTP.Host, cfg.SMTP.Port)
-	auth := smtp.PlainAuth("", cfg.SMTP.User, cfg.SMTP.Password, cfg.SMTP.Host)
-	var err error
-	if cfg.SMTP.Port == 465 {
-		err = e.SendWithTLS(addr, auth, &tls.Config{ServerName: cfg.SMTP.Host})
-	} else {
-		err = e.Send(addr, auth)
-	}
-	if err != nil {
-		logf("erro ao enviar email: %v", err)
-	} else {
-		logf("email enviado: %s", subject)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +169,6 @@ func cleanNumber(s string) string {
 	}, s)
 }
 
-// removeNinthDigit remove o 9 extra (Brasil): 55 + DD + 9 + 8 dígitos → 55 + DD + 8 dígitos
 func removeNinthDigit(n string) string {
 	if len(n) == 13 && strings.HasPrefix(n, "55") {
 		return n[:4] + n[5:]
@@ -239,17 +209,21 @@ func portugueseWeekday(d time.Weekday) string {
 }
 
 // ---------------------------------------------------------------------------
-// Batcher
+// Batcher (Com suporte a múltiplos arquivos)
 // ---------------------------------------------------------------------------
 
 const flushDelay = 2 * time.Minute
 
+type FileAttachment struct {
+	Name string
+	Data []byte
+}
+
 type PendingMsg struct {
-    msgType  string
-    txt      string
-    fileName string 
-    fileData []byte 
-    ts       time.Time
+	msgType string
+	txt     string
+	Files   []FileAttachment
+	ts      time.Time
 }
 
 type Batcher struct {
@@ -277,9 +251,7 @@ func (b *Batcher) Add(jid, pushName string, msg PendingMsg) {
 
 	b.pending[jid] = append(b.pending[jid], msg)
 
-	if _, seen := b.names[jid]; !seen {
-		b.names[jid] = findName(jid, b.contacts, pushName)
-	} else if b.names[jid] == jid || b.names[jid] == "" {
+	if _, seen := b.names[jid]; !seen || b.names[jid] == jid || b.names[jid] == "" {
 		b.names[jid] = findName(jid, b.contacts, pushName)
 	}
 
@@ -311,11 +283,12 @@ func (b *Batcher) flush(jid string) {
 		return
 	}
 
+	e := email.NewEmail()
+	e.From = fmt.Sprintf("Zap <%s>", b.cfg.SMTP.User)
+	e.To = []string{b.cfg.SMTP.User}
+
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "De: %s\n%d mensagem(ns)\n\n", name, len(msgs))
-
-	var lastFileData []byte
-	var lastFileName string
 
 	for i, m := range msgs {
 		fmt.Fprintf(&sb, "── %d  [%s] %s %s ──\n",
@@ -325,19 +298,36 @@ func (b *Batcher) flush(jid string) {
 		if m.txt != "" {
 			fmt.Fprintf(&sb, "%s\n", m.txt)
 		}
-		if len(m.fileData) > 0 {
-			lastFileData = m.fileData
-			lastFileName = m.fileName
+
+		// Anexa todos os arquivos desta mensagem específica
+		for _, file := range m.Files {
+			if len(file.Data) > 0 {
+				e.Attach(bytes.NewReader(file.Data), file.Name, "application/octet-stream")
+			}
 		}
 		sb.WriteString("\n")
 	}
 
-	subject := fmt.Sprintf("Zap de %s [%d msg]", name, len(msgs))
-	sendEmailWithAttachment(b.cfg, subject, sb.String(), lastFileName, lastFileData)
+	e.Subject = fmt.Sprintf("Zap de %s [%d msg]", name, len(msgs))
+	e.Text = []byte(sb.String())
+
+	addr := fmt.Sprintf("%s:%d", b.cfg.SMTP.Host, b.cfg.SMTP.Port)
+	auth := smtp.PlainAuth("", b.cfg.SMTP.User, b.cfg.SMTP.Password, b.cfg.SMTP.Host)
+
+	var err error
+	if b.cfg.SMTP.Port == 465 {
+		err = e.SendWithTLS(addr, auth, &tls.Config{ServerName: b.cfg.SMTP.Host})
+	} else {
+		err = e.Send(addr, auth)
+	}
+
+	if err != nil {
+		logf("erro ao enviar email: %v", err)
+	} else {
+		logf("email enviado: %s", e.Subject)
+	}
 }
 
-// FlushAll cancela todos os timers e envia imediatamente os lotes pendentes.
-// Chamado no shutdown para não perder mensagens acumuladas.
 func (b *Batcher) FlushAll() {
 	b.mu.Lock()
 	jids := make([]string, 0, len(b.pending))
@@ -405,6 +395,7 @@ func buildHandler(client *whatsmeow.Client, batcher *Batcher) func(interface{}) 
 		if !ok || v.Info.IsFromMe {
 			return
 		}
+		// Ignora grupos e status
 		if v.Info.Chat.Server == "g.us" || v.Info.Chat.User == "status" {
 			return
 		}
@@ -459,12 +450,16 @@ func buildHandler(client *whatsmeow.Client, batcher *Batcher) func(interface{}) 
 			logf("erro download: %v", err)
 		}
 
+		var files []FileAttachment
+		if len(fileData) > 0 {
+			files = append(files, FileAttachment{Name: fileName, Data: fileData})
+		}
+
 		batcher.Add(v.Info.Sender.User, v.Info.PushName, PendingMsg{
-			msgType:  msgType,
-			txt:      txt,
-			fileName: fileName,
-			fileData: fileData,
-			ts:       v.Info.Timestamp,
+			msgType: msgType,
+			txt:     txt,
+			Files:   files,
+			ts:      v.Info.Timestamp,
 		})
 	}
 }
@@ -489,7 +484,6 @@ func runDaemon() {
 
 	client.AddEventHandler(buildHandler(client, batcher))
 
-	// Reconexão automática com backoff exponencial
 	client.AddEventHandler(func(evt interface{}) {
 		if _, ok := evt.(*events.Disconnected); !ok {
 			return
@@ -576,7 +570,6 @@ func runSend() {
 // ---------------------------------------------------------------------------
 
 func main() {
-	// Calcula exeDir uma vez — usado por loadConfig, newClient, initLog, acquireLock
 	exe, _ := os.Executable()
 	real, _ := filepath.EvalSymlinks(exe)
 	exeDir = filepath.Dir(real)
