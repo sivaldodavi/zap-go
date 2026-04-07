@@ -245,11 +245,11 @@ func portugueseWeekday(d time.Weekday) string {
 const flushDelay = 2 * time.Minute
 
 type PendingMsg struct {
-	msgType  string
-	txt      string
-	fileName string
-	fileData []byte
-	ts       time.Time
+    msgType  string
+    txt      string
+    fileName string 
+    fileData []byte 
+    ts       time.Time
 }
 
 type Batcher struct {
