@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
 	"net/smtp"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/jordan-wright/email"
 	"github.com/mdp/qrterminal/v3"
 	_ "github.com/mattn/go-sqlite3"
@@ -50,10 +52,12 @@ func initLog(dir string) {
 
 func rotateIfNeeded(path string) {
 	info, err := os.Stat(path)
-	if err != nil || info.Size() < 1<<20 { // 1 MB
+	if os.IsNotExist(err) || info == nil || info.Size() < 1<<20 {
 		return
 	}
-	os.Rename(path, path+".1")
+	if err := os.Rename(path, path+".1"); err != nil {
+		fmt.Fprintln(os.Stderr, "rotate log:", err)
+	}
 }
 
 func logf(format string, args ...interface{}) {
@@ -103,8 +107,7 @@ func acquireLock() (*os.File, bool) {
 	if err != nil {
 		return nil, false
 	}
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err != nil {
+	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		return nil, false
 	}
@@ -119,11 +122,45 @@ func releaseLock(f *os.File) {
 }
 
 // ---------------------------------------------------------------------------
-// Abook & helpers
+// Abook & índice
 // ---------------------------------------------------------------------------
 
 type Contact struct {
 	Name, Mobile string
+}
+
+type AbookIndex struct {
+	bySuffix map[string]string // últimos 8 dígitos → nome
+}
+
+func buildIndex(contacts []Contact) AbookIndex {
+	idx := AbookIndex{bySuffix: make(map[string]string, len(contacts))}
+	for _, c := range contacts {
+		n := cleanNumber(c.Mobile)
+		if len(n) >= 8 {
+			idx.bySuffix[n[len(n)-8:]] = c.Name
+		}
+	}
+	return idx
+}
+
+func (idx AbookIndex) Lookup(jidUser, pushName string) string {
+	clean := cleanNumber(jidUser)
+	variants := []string{clean}
+	if alt := removeNinthDigit(clean); alt != "" {
+		variants = append(variants, alt)
+	}
+	for _, v := range variants {
+		if len(v) >= 8 {
+			if name, ok := idx.bySuffix[v[len(v)-8:]]; ok {
+				return name
+			}
+		}
+	}
+	if pushName != "" {
+		return pushName
+	}
+	return jidUser
 }
 
 func loadAbook() []Contact {
@@ -176,40 +213,12 @@ func removeNinthDigit(n string) string {
 	return ""
 }
 
-func findName(jidUser string, contacts []Contact, pushName string) string {
-	jidClean := cleanNumber(jidUser)
-	variants := []string{jidClean}
-	if alt := removeNinthDigit(jidClean); alt != "" {
-		variants = append(variants, alt)
-	}
-	for _, c := range contacts {
-		cClean := cleanNumber(c.Mobile)
-		for _, v := range variants {
-			if v == cClean {
-				return c.Name
-			}
-		}
-		if len(cClean) >= 8 {
-			suffix := cClean[len(cClean)-8:]
-			for _, v := range variants {
-				if len(v) >= 8 && v[len(v)-8:] == suffix {
-					return c.Name
-				}
-			}
-		}
-	}
-	if pushName != "" {
-		return pushName
-	}
-	return jidUser
-}
-
 func portugueseWeekday(d time.Weekday) string {
 	return [...]string{"Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"}[d]
 }
 
 // ---------------------------------------------------------------------------
-// Batcher (Com suporte a múltiplos arquivos)
+// Batcher
 // ---------------------------------------------------------------------------
 
 const flushDelay = 2 * time.Minute
@@ -217,31 +226,32 @@ const flushDelay = 2 * time.Minute
 type FileAttachment struct {
 	Name string
 	Data []byte
+	Mime string
 }
 
 type PendingMsg struct {
 	msgType string
 	txt     string
-	Files   []FileAttachment
+	files   []FileAttachment
 	ts      time.Time
 }
 
 type Batcher struct {
-	mu       sync.Mutex
-	pending  map[string][]PendingMsg
-	timers   map[string]*time.Timer
-	names    map[string]string
-	cfg      Config
-	contacts []Contact
+	mu      sync.Mutex
+	pending map[string][]PendingMsg
+	timers  map[string]*time.Timer
+	names   map[string]string
+	cfg     Config
+	idx     AbookIndex
 }
 
-func newBatcher(cfg Config, contacts []Contact) *Batcher {
+func newBatcher(cfg Config, idx AbookIndex) *Batcher {
 	return &Batcher{
-		pending:  make(map[string][]PendingMsg),
-		timers:   make(map[string]*time.Timer),
-		names:    make(map[string]string),
-		cfg:      cfg,
-		contacts: contacts,
+		pending: make(map[string][]PendingMsg),
+		timers:  make(map[string]*time.Timer),
+		names:   make(map[string]string),
+		cfg:     cfg,
+		idx:     idx,
 	}
 }
 
@@ -251,8 +261,8 @@ func (b *Batcher) Add(jid, pushName string, msg PendingMsg) {
 
 	b.pending[jid] = append(b.pending[jid], msg)
 
-	if _, seen := b.names[jid]; !seen || b.names[jid] == jid || b.names[jid] == "" {
-		b.names[jid] = findName(jid, b.contacts, pushName)
+	if b.names[jid] == "" || b.names[jid] == jid {
+		b.names[jid] = b.idx.Lookup(jid, pushName)
 	}
 
 	if t, ok := b.timers[jid]; ok {
@@ -265,9 +275,7 @@ func (b *Batcher) Add(jid, pushName string, msg PendingMsg) {
 	}
 
 	jidCopy := jid
-	b.timers[jid] = time.AfterFunc(flushDelay, func() {
-		b.flush(jidCopy)
-	})
+	b.timers[jid] = time.AfterFunc(flushDelay, func() { b.flush(jidCopy) })
 }
 
 func (b *Batcher) flush(jid string) {
@@ -286,6 +294,7 @@ func (b *Batcher) flush(jid string) {
 	e := email.NewEmail()
 	e.From = fmt.Sprintf("Zap <%s>", b.cfg.SMTP.User)
 	e.To = []string{b.cfg.SMTP.User}
+	e.Subject = fmt.Sprintf("Zap de %s [%d msg]", name, len(msgs))
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "De: %s\n%d mensagem(ns)\n\n", name, len(msgs))
@@ -298,17 +307,18 @@ func (b *Batcher) flush(jid string) {
 		if m.txt != "" {
 			fmt.Fprintf(&sb, "%s\n", m.txt)
 		}
-
-		// Anexa todos os arquivos desta mensagem específica
-		for _, file := range m.Files {
-			if len(file.Data) > 0 {
-				e.Attach(bytes.NewReader(file.Data), file.Name, "application/octet-stream")
+		for _, fa := range m.files {
+			if len(fa.Data) > 0 {
+				mime := fa.Mime
+				if mime == "" {
+					mime = "application/octet-stream"
+				}
+				e.Attach(bytes.NewReader(fa.Data), fa.Name, mime)
 			}
 		}
 		sb.WriteString("\n")
 	}
 
-	e.Subject = fmt.Sprintf("Zap de %s [%d msg]", name, len(msgs))
 	e.Text = []byte(sb.String())
 
 	addr := fmt.Sprintf("%s:%d", b.cfg.SMTP.Host, b.cfg.SMTP.Port)
@@ -386,8 +396,80 @@ func connectClient(client *whatsmeow.Client) error {
 }
 
 // ---------------------------------------------------------------------------
-// Handler de mensagens
+// Handler de mensagens recebidas
 // ---------------------------------------------------------------------------
+
+type msgInfo struct {
+	msgType string
+	txt     string
+	fileName string
+	mimeType string
+	media   whatsmeow.DownloadableMessage
+}
+
+func classifyMessage(raw *waE2E.Message) (msgInfo, bool) {
+	switch {
+	case raw.GetConversation() != "":
+		return msgInfo{msgType: "Texto", txt: raw.GetConversation()}, true
+
+	case raw.GetExtendedTextMessage() != nil:
+		return msgInfo{msgType: "Texto", txt: raw.GetExtendedTextMessage().GetText()}, true
+
+	case raw.GetImageMessage() != nil:
+		m := raw.GetImageMessage()
+		return msgInfo{
+			msgType:  "Imagem",
+			txt:      m.GetCaption(),
+			fileName: "imagem.jpg",
+			mimeType: m.GetMimetype(),
+			media:    m,
+		}, true
+
+	case raw.GetStickerMessage() != nil:
+		return msgInfo{
+			msgType:  "Figurinha",
+			fileName: "sticker.webp",
+			mimeType: "image/webp",
+			media:    raw.GetStickerMessage(),
+		}, true
+
+	case raw.GetAudioMessage() != nil:
+		m := raw.GetAudioMessage()
+		return msgInfo{
+			msgType:  "Áudio",
+			txt:      fmt.Sprintf("Duração: %ds", m.GetSeconds()),
+			fileName: "audio.ogg",
+			mimeType: m.GetMimetype(),
+			media:    m,
+		}, true
+
+	case raw.GetVideoMessage() != nil:
+		m := raw.GetVideoMessage()
+		return msgInfo{
+			msgType:  "Vídeo",
+			txt:      m.GetCaption(),
+			fileName: "video.mp4",
+			mimeType: m.GetMimetype(),
+			media:    m,
+		}, true
+
+	case raw.GetDocumentMessage() != nil:
+		m := raw.GetDocumentMessage()
+		name := m.GetFileName()
+		if name == "" {
+			name = "arquivo_recebido"
+		}
+		return msgInfo{
+			msgType:  "Documento",
+			txt:      name,
+			fileName: name,
+			mimeType: m.GetMimetype(),
+			media:    m,
+		}, true
+	}
+
+	return msgInfo{}, false
+}
 
 func buildHandler(client *whatsmeow.Client, batcher *Batcher) func(interface{}) {
 	return func(evt interface{}) {
@@ -395,7 +477,6 @@ func buildHandler(client *whatsmeow.Client, batcher *Batcher) func(interface{}) 
 		if !ok || v.Info.IsFromMe {
 			return
 		}
-		// Ignora grupos e status
 		if v.Info.Chat.Server == "g.us" || v.Info.Chat.User == "status" {
 			return
 		}
@@ -405,62 +486,106 @@ func buildHandler(client *whatsmeow.Client, batcher *Batcher) func(interface{}) 
 			rawMsg = rawMsg.GetDeviceSentMessage().GetMessage()
 		}
 
-		var txt, msgType, fileName string
-		var fileData []byte
-		var err error
-
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
-		switch {
-		case rawMsg.GetConversation() != "":
-			txt, msgType = rawMsg.GetConversation(), "Texto"
-		case rawMsg.GetExtendedTextMessage() != nil:
-			txt, msgType = rawMsg.GetExtendedTextMessage().GetText(), "Texto"
-		case rawMsg.GetImageMessage() != nil:
-			m := rawMsg.GetImageMessage()
-			msgType, txt, fileName = "Imagem", "Legenda: "+m.GetCaption(), "imagem.jpg"
-			fileData, err = client.Download(ctx, m)
-		case rawMsg.GetStickerMessage() != nil:
-			msgType, txt, fileName = "Figurinha", "[Figurinha]", "sticker.webp"
-			fileData, err = client.Download(ctx, rawMsg.GetStickerMessage())
-		case rawMsg.GetAudioMessage() != nil:
-			m := rawMsg.GetAudioMessage()
-			msgType, txt, fileName = "Áudio", fmt.Sprintf("Duração: %ds", m.GetSeconds()), "audio.ogg"
-			fileData, err = client.Download(ctx, m)
-		case rawMsg.GetVideoMessage() != nil:
-			m := rawMsg.GetVideoMessage()
-			msgType, txt, fileName = "Vídeo", "Legenda: "+m.GetCaption(), "video.mp4"
-			fileData, err = client.Download(ctx, m)
-		case rawMsg.GetDocumentMessage() != nil:
-			m := rawMsg.GetDocumentMessage()
-			msgType = "Documento"
-			txt = "Arquivo original: " + m.GetFileName()
-			fileName = m.GetFileName()
-			if fileName == "" {
-				fileName = "arquivo_recebido"
-			}
-			fileData, err = client.Download(ctx, m)
-		}
-
-		if msgType == "" {
+		info, ok := classifyMessage(rawMsg)
+		if !ok {
 			return
 		}
-		if err != nil {
-			logf("erro download: %v", err)
-		}
 
-		var files []FileAttachment
-		if len(fileData) > 0 {
-			files = append(files, FileAttachment{Name: fileName, Data: fileData})
-		}
-
-		batcher.Add(v.Info.Sender.User, v.Info.PushName, PendingMsg{
-			msgType: msgType,
-			txt:     txt,
-			Files:   files,
+		msg := PendingMsg{
+			msgType: info.msgType,
+			txt:     info.txt,
 			ts:      v.Info.Timestamp,
+		}
+
+		if info.media != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			data, err := client.Download(ctx, info.media)
+			if err != nil {
+				logf("erro download: %v", err)
+			} else if len(data) > 0 {
+				msg.files = []FileAttachment{{
+					Name: info.fileName,
+					Data: data,
+					Mime: info.mimeType,
+				}}
+			}
+		}
+
+		batcher.Add(v.Info.Sender.User, v.Info.PushName, msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Envio de arquivos
+// ---------------------------------------------------------------------------
+
+func sendFile(client *whatsmeow.Client, jid types.JID, path, caption string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("leitura: %w", err)
+	}
+
+	mime := mimetype.Detect(data).String()
+	ctx := context.Background()
+
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		uploaded, err := client.Upload(ctx, data, whatsmeow.MediaImage)
+		if err != nil {
+			return fmt.Errorf("upload: %w", err)
+		}
+		_, err = client.SendMessage(ctx, jid, &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption:       proto.String(caption),
+				Mimetype:      proto.String(mime),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
 		})
+		return err
+
+	case strings.HasPrefix(mime, "video/"):
+		uploaded, err := client.Upload(ctx, data, whatsmeow.MediaVideo)
+		if err != nil {
+			return fmt.Errorf("upload: %w", err)
+		}
+		_, err = client.SendMessage(ctx, jid, &waE2E.Message{
+			VideoMessage: &waE2E.VideoMessage{
+				Caption:       proto.String(caption),
+				Mimetype:      proto.String(mime),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		})
+		return err
+
+	default: // PDF, DOCX e qualquer outro documento
+		uploaded, err := client.Upload(ctx, data, whatsmeow.MediaDocument)
+		if err != nil {
+			return fmt.Errorf("upload: %w", err)
+		}
+		_, err = client.SendMessage(ctx, jid, &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{
+				FileName:      proto.String(filepath.Base(path)),
+				Mimetype:      proto.String(mime),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		})
+		return err
 	}
 }
 
@@ -479,8 +604,9 @@ func runDaemon() {
 	cfg := loadConfig()
 	initLog(exeDir)
 	contacts := loadAbook()
+	idx := buildIndex(contacts)
 	client := newClient()
-	batcher := newBatcher(cfg, contacts)
+	batcher := newBatcher(cfg, idx)
 
 	client.AddEventHandler(buildHandler(client, batcher))
 
@@ -491,7 +617,8 @@ func runDaemon() {
 		logf("desconectado — tentando reconectar...")
 		backoff := 5 * time.Second
 		for {
-			time.Sleep(backoff)
+			jitter := time.Duration(rand.Intn(3000)) * time.Millisecond
+			time.Sleep(backoff + jitter)
 			if err := connectClient(client); err == nil {
 				logf("reconectado com sucesso")
 				return
@@ -523,6 +650,12 @@ func runDaemon() {
 
 // ---------------------------------------------------------------------------
 // Send
+//
+// Uso:
+//   zap send                        → escolhe contato via fzf, loop de texto
+//   zap send foto.jpg               → envia imagem
+//   zap send doc.pdf "legenda"      → envia documento com legenda/caption
+//   zap send video.mp4 "legenda"    → envia vídeo com legenda
 // ---------------------------------------------------------------------------
 
 func runSend() {
@@ -531,17 +664,21 @@ func runSend() {
 	for _, c := range contacts {
 		lines = append(lines, fmt.Sprintf("%s\t%s", c.Name, c.Mobile))
 	}
+
 	cmd := exec.Command("fzf", "--prompt=para: ", "--delimiter=\t", "--with-nth=1")
 	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		return
 	}
+
 	parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 2)
 	if len(parts) < 2 {
 		fmt.Fprintln(os.Stderr, "contato inválido")
 		return
 	}
+
 	jid, _ := types.ParseJID(cleanNumber(parts[1]) + "@s.whatsapp.net")
 	client := newClient()
 	if err := connectClient(client); err != nil {
@@ -551,6 +688,21 @@ func runSend() {
 	defer client.Disconnect()
 
 	fmt.Printf("Para: %s\n", parts[0])
+
+	// Envio de arquivo passado como argumento
+	if len(os.Args) >= 3 {
+		filePath := os.Args[2]
+		caption := ""
+		if len(os.Args) >= 4 {
+			caption = os.Args[3]
+		}
+		if err := sendFile(client, jid, filePath, caption); err != nil {
+			fmt.Fprintln(os.Stderr, "erro ao enviar arquivo:", err)
+		}
+		return
+	}
+
+	// Loop interativo de texto
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("> ")
@@ -561,7 +713,9 @@ func runSend() {
 		if t == "" {
 			break
 		}
-		client.SendMessage(context.Background(), jid, &waE2E.Message{Conversation: proto.String(t)})
+		client.SendMessage(context.Background(), jid, &waE2E.Message{
+			Conversation: proto.String(t),
+		})
 	}
 }
 
@@ -575,13 +729,16 @@ func main() {
 	exeDir = filepath.Dir(real)
 
 	if len(os.Args) < 2 {
-		fmt.Println("uso: zap <daemon|send>")
+		fmt.Println("uso: zap <daemon|send> [arquivo] [legenda]")
 		return
 	}
+
 	switch os.Args[1] {
 	case "daemon":
 		runDaemon()
 	case "send":
 		runSend()
+	default:
+		fmt.Println("uso: zap <daemon|send> [arquivo] [legenda]")
 	}
 }
