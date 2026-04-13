@@ -150,7 +150,6 @@ func digitsOnly(s string) string {
 	}, s)
 }
 
-// Resolve nome: tenta sufixo de 8 dígitos, com/sem 9º dígito, fallback pushName.
 func lookupName(jidUser, pushName string, idx map[string]string) string {
 	n := digitsOnly(jidUser)
 	for _, v := range []string{n, func() string {
