@@ -1,11 +1,8 @@
-module wtc
+module zap
 
 go 1.25.5
 
 require (
-	github.com/BurntSushi/toml v1.6.0
-	github.com/gabriel-vasile/mimetype v1.4.13
-	github.com/jordan-wright/email v4.0.1-0.20210109023952-943e75fe5223+incompatible
 	github.com/mattn/go-sqlite3 v1.14.40
 	github.com/mdp/qrterminal/v3 v3.2.1
 	go.mau.fi/whatsmeow v0.0.0-20260327181659-02ec817e7cf4

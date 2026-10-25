@@ -1,11 +1,14 @@
+# Binário e artefatos de build
+/zap
 
-config.toml
-
-zap*
-
-# Dados sensíveis
-whatsapp.db
-
-# Logs e temporários
-/tmp/wtc_status
+# Runtime: sessão do WhatsApp, idempotência, lock e logs. Nunca versionar.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.lock
 *.log
+
+# Token da API
+token
+*.token
